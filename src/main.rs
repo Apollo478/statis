@@ -1,3 +1,4 @@
+mod capture;
 use image::{ImageBuffer, Rgb};
 use x11rb::{connection::Connection, protocol::xproto::{get_image, ImageFormat}};
 fn main() {
