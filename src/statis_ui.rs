@@ -1,232 +1,241 @@
-use iced::{
-    alignment::{Horizontal, Vertical}, 
-    mouse, 
-    widget::{button, canvas::{self, Event, Frame, Path, Program}, container, text, Canvas}, 
-    Border, Color, Element, Length, Point, Rectangle, Shadow, Size, Task, Vector
-};
-use iced::widget::canvas::Geometry;
-use iced::{Renderer, Theme};
-use iced::window;
+use x11rb::{connection::Connection, protocol::Event};
+use x11rb::protocol::xproto::*;
+use x11rb::rust_connection::RustConnection;
+use x11rb::COPY_DEPTH_FROM_PARENT;
+use image::{ImageBuffer, Rgb};
+use std::error::Error;
 
-pub struct Statis {
+use crate::capture::{ScreenCapture, CaptureRegion};
+
+pub struct X11ScreenshotTool {
+    conn: RustConnection,
+    screen_num: usize,
+    window: u32,
+    root: u32,
+    width: u16,
+    height: u16,
     selecting: bool,
-    start: Option<Point>,
-    current: Option<Point>,
+    start_x: i16,
+    start_y: i16,
+    current_x: i16,
+    current_y: i16,
+    screenshot_pixmap: u32, 
+    gc: u32,
 }
 
-#[derive(Debug, Clone)]
-pub enum Message {
-    CaptureFullScreen,
-    MousePressed(Point),
-    MouseMoved(Point),
-    MouseReleased(Point),
-}
+impl X11ScreenshotTool {
+    pub fn new() -> Result<Self, Box<dyn Error>> {
+        let (conn, screen_num) = x11rb::connect(None)?;
+        let screen = &conn.setup().roots[screen_num];
+        let root = screen.root;
+        let width = screen.width_in_pixels;
+        let height = screen.height_in_pixels;
 
-impl Statis {
-    pub fn new() -> (Self, Task<Message>) {
-        (
-            Self {
-                selecting: false,
-                start: None,
-                current: None,
-            }, 
-            Task::none()
-        )
+        let capture = ScreenCapture::new()?;
+        let screenshot = capture.capture_full_screen()?;
+
+        let window = conn.generate_id()?;
+        
+        let win_aux = CreateWindowAux::new()
+            .background_pixel(0)
+            .border_pixel(0)
+            .override_redirect(1)
+            .event_mask(
+                EventMask::EXPOSURE
+                    | EventMask::BUTTON_PRESS
+                    | EventMask::BUTTON_RELEASE
+                    | EventMask::POINTER_MOTION
+                    | EventMask::KEY_PRESS
+            );
+
+        conn.create_window(
+            COPY_DEPTH_FROM_PARENT,
+            window,
+            root,
+            0,
+            0,
+            width,
+            height,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            screen.root_visual,
+            &win_aux,
+        )?;
+
+        let screenshot_pixmap = conn.generate_id()?;
+        conn.create_pixmap(24, screenshot_pixmap, window, width, height)?;
+        
+        let gc = conn.generate_id()?;
+        conn.create_gc(gc, screenshot_pixmap, &CreateGCAux::new())?;
+        
+        let mut data = Vec::with_capacity((width as usize) * (height as usize) * 4);
+        for pixel in screenshot.pixels() {
+            data.push(pixel[2]); 
+            data.push(pixel[1]); 
+            data.push(pixel[0]); 
+            data.push(0);        
+        }
+        
+        conn.put_image(
+            ImageFormat::Z_PIXMAP,
+            screenshot_pixmap,
+            gc,
+            width,
+            height,
+            0,
+            0,
+            0,
+            24,
+            &data,
+        )?;
+
+        // Map window
+        conn.map_window(window)?;
+        conn.configure_window(
+            window,
+            &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+        )?;
+
+        conn.flush()?;
+
+        Ok(Self {
+            conn,
+            screen_num,
+            window,
+            root,
+            width,
+            height,
+            selecting: false,
+            start_x: 0,
+            start_y: 0,
+            current_x: 0,
+            current_y: 0,
+            screenshot_pixmap,
+            gc,
+        })
     }
 
-    pub fn update(&mut self, message: Message) -> Task<Message> {
-        match message {
-            Message::CaptureFullScreen => {
-                println!("Entering selection mode!");
-                self.selecting = true;
-                // Resize window to fullscreen
-                Task::batch(vec![
-                    window::get_oldest().and_then(|id| window::resize(id, Size::new(1920.0, 1080.0))),
-                    window::get_oldest().and_then(|id| window::move_to(id, Point::new(0.0, 0.0)))
-                ])
-            }
-            Message::MousePressed(p) => {
-                if self.selecting {
-                    self.start = Some(p);
-                    self.current = Some(p);
+    pub fn run(&mut self) -> Result<(), Box<dyn Error>> {
+        // Initial draw
+        self.redraw()?;
+        
+        loop {
+            let event = self.conn.wait_for_event()?;
+            
+            match event {
+                Event::Expose(_) => {
+                    self.redraw()?;
                 }
-                Task::none()
-            }
-            Message::MouseMoved(p) => {
-                if self.selecting && self.start.is_some() {
-                    self.current = Some(p);
-                }
-                Task::none()
-            }
-            Message::MouseReleased(p) => {
-                if self.selecting {
-                    if let Some(start) = self.start {
-                        let x1 = start.x.min(p.x);   
-                        let y1 = start.y.min(p.y);
-                        let x2 = start.x.max(p.x);
-                        let y2 = start.y.max(p.y);
-                        
-                        println!("Selected region: x={} y={} width={} height={}", x1, y1, x2-x1, y2-y1);
-                        
-                        // TODO: Call your capture code here
-                        
-                        self.selecting = false;
-                        self.start = None;
-                        self.current = None;
-                        
-                        // Restore original window size and position
-                        return Task::batch(vec![
-                            window::get_oldest().and_then(|id| window::resize(id, Size::new(400.0, 80.0))),
-                            window::get_oldest().and_then(|id| window::move_to(id, Point::new(760.0, 0.0)))
-                        ]);
+                Event::ButtonPress(event) => {
+                    if event.detail == 1 {
+                        self.selecting = true;
+                        self.start_x = event.event_x;
+                        self.start_y = event.event_y;
+                        self.current_x = event.event_x;
+                        self.current_y = event.event_y;
+                        self.redraw()?;
                     }
                 }
-                Task::none()
+                Event::MotionNotify(event) => {
+                    if self.selecting {
+                        self.current_x = event.event_x;
+                        self.current_y = event.event_y;
+                        self.redraw()?;
+                    }
+                }
+                Event::ButtonRelease(event) => {
+                    if event.detail == 1 && self.selecting {
+                        self.selecting = false;
+                        
+                        let x1 = self.start_x.min(self.current_x);
+                        let y1 = self.start_y.min(self.current_y);
+                        let x2 = self.start_x.max(self.current_x);
+                        let y2 = self.start_y.max(self.current_y);
+                        
+                        let width = (x2 - x1) as u16;
+                        let height = (y2 - y1) as u16;
+                        
+                        if width > 0 && height > 0 {
+                            self.capture_selection(x1, y1, width, height)?;
+                        }
+                        
+                        return Ok(());
+                    }
+                }
+                Event::KeyPress(event) => {
+                    if event.detail == 9 {
+                        return Ok(());
+                    }
+                }
+                _ => {}
             }
         }
     }
 
-    pub fn view(&self) -> Element<Message> {
+    fn redraw(&self) -> Result<(), Box<dyn Error>> {
+        // Copy screenshot from pixmap to window (very fast)
+        self.conn.copy_area(
+            self.screenshot_pixmap,
+            self.window,
+            self.gc,
+            0, 0,
+            0, 0,
+            self.width,
+            self.height,
+        )?;
+        
+        // Draw selection rectangle if selecting
         if self.selecting {
-            let program = SelectionProgram {
-                start: self.start,
-                current: self.current,
-            };
-            
-            let canvas = Canvas::new(program)
-                .width(Length::Fill)
-                .height(Length::Fill);
-            
-            return container(canvas)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(|_| container::Style {
-                    background: Some(Color::from_rgba(0.0, 0.0, 0.0, 0.4).into()),
-                    ..Default::default()
-                })
-                .into();
+            let x = self.start_x.min(self.current_x);
+            let y = self.start_y.min(self.current_y);
+            let width = (self.start_x.max(self.current_x) - x) as u16;
+            let height = (self.start_y.max(self.current_y) - y) as u16;
+
+            // Update GC for drawing rectangle
+            self.conn.change_gc(
+                self.gc,
+                &ChangeGCAux::new()
+                    .foreground(0x4099FF)
+                    .line_width(3)
+            )?;
+
+            self.conn.poly_rectangle(
+                self.window,
+                self.gc,
+                &[Rectangle { x, y, width, height }],
+            )?;
         }
+        
+        self.conn.flush()?;
+        Ok(())
+    }
 
-        let btn = button(
-            text("Capture Area")
-                .size(16)
-        )
-        .on_press(Message::CaptureFullScreen)
-        .padding([10, 24])
-        .style(|_theme, status| {
-            let base = Color::from_rgba(0.25, 0.25, 0.3, 0.9);
-            let hover = Color::from_rgba(0.35, 0.35, 0.45, 0.95);
-            button::Style {
-                background: Some(match status {
-                    button::Status::Hovered => hover.into(),
-                    button::Status::Pressed => Color::from_rgba(0.2, 0.2, 0.25, 0.9).into(),
-                    _ => base.into(),
-                }),
-                text_color: Color::WHITE,
-                border: Border {
-                    color: Color::from_rgba(0.6, 0.6, 0.7, 0.6),
-                    width: 1.0,
-                    radius: 10.0.into(),
-                },
-                shadow: Shadow {
-                    color: Color::from_rgba(0.0, 0.0, 0.0, 0.5),
-                    offset: Vector::new(0.0, 3.0),
-                    blur_radius: 10.0,
-                },
-                ..Default::default()
-            }
-        });
-
-        container(btn)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .padding(16)
-            .center(Length::Fill)
-            .align_y(Vertical::Center)
-            .style(|_theme| container::Style {
-                background: Some(Color::from_rgba(0.12, 0.12, 0.15, 0.95).into()),
-                border: Border {
-                    color: Color::from_rgba(0.4, 0.4, 0.5, 0.6),
-                    width: 1.0,
-                    radius: 14.0.into(),
-                },
-                shadow: Shadow {
-                    color: Color::from_rgba(0.0, 0.0, 0.0, 0.7),
-                    offset: Vector::new(0.0, 6.0),
-                    blur_radius: 16.0,
-                },
-                ..Default::default()
-            })
-            .into()
+    fn capture_selection(&self, x: i16, y: i16, width: u16, height: u16) -> Result<(), Box<dyn Error>> {
+        println!("Capturing region: x={}, y={}, width={}, height={}", x, y, width, height);
+        
+        let capture = ScreenCapture::new()?;
+        let img = capture.capture_region(CaptureRegion {
+            x: x.try_into().unwrap(),
+            y: y.try_into().unwrap(),
+            width,
+            height,
+        })?;
+        
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let path = format!("{}/Downloads/screenshot.png", home);
+        img.save(&path)?;
+        
+        println!("Saved to {}", path);
+        
+        Ok(())
     }
 }
 
-struct SelectionProgram {
-    start: Option<Point>,
-    current: Option<Point>,
-}
-
-impl Program<Message> for SelectionProgram {
-    type State = ();
-
-    fn update(
-        &self,
-        _state: &mut Self::State,
-        event: Event,
-        bounds: Rectangle,
-        cursor: mouse::Cursor,
-    ) -> (canvas::event::Status, Option<Message>) {
-        match event {
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                if let Some(pos) = cursor.position_in(bounds) {
-                    return (canvas::event::Status::Captured, Some(Message::MousePressed(pos)));
-                }
-            }
-            Event::Mouse(mouse::Event::CursorMoved { position }) => {
-                return (canvas::event::Status::Captured, Some(Message::MouseMoved(position)));
-            }
-            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                if let Some(pos) = cursor.position_in(bounds) {
-                    return (canvas::event::Status::Captured, Some(Message::MouseReleased(pos)));
-                }
-            }
-            _ => {}
-        }
-        (canvas::event::Status::Ignored, None)
-    }
-
-    fn draw(
-        &self,
-        _state: &(),
-        renderer: &Renderer,
-        _theme: &Theme,
-        bounds: Rectangle,
-        _cursor: mouse::Cursor,
-    ) -> Vec<Geometry> {
-        let mut frame = Frame::new(renderer, bounds.size());
-        
-        if let (Some(start), Some(end)) = (self.start, self.current) {
-            let x = start.x.min(end.x);
-            let y = start.y.min(end.y);
-            let w = (end.x - start.x).abs();
-            let h = (end.y - start.y).abs();
-            
-            let rect = Path::rectangle(Point::new(x, y), iced::Size::new(w, h));
-            
-            // Semi-transparent blue fill
-            frame.fill(&rect, Color::from_rgba(0.3, 0.6, 1.0, 0.3));
-            
-            // Bright border
-            frame.stroke(
-                &rect,
-                canvas::Stroke {
-                    style: canvas::Style::Solid(Color::from_rgb(0.3, 0.7, 1.0)),
-                    width: 3.0,
-                    ..Default::default()
-                },
-            );
-        }
-        
-        vec![frame.into_geometry()]
+impl Drop for X11ScreenshotTool {
+    fn drop(&mut self) {
+        let _ = self.conn.free_gc(self.gc);
+        let _ = self.conn.free_pixmap(self.screenshot_pixmap);
+        let _ = self.conn.destroy_window(self.window);
+        let _ = self.conn.flush();
     }
 }

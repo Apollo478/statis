@@ -1,14 +1,10 @@
-
-use crate::statis_ui::Statis;
-use iced::Result;
+mod capture;
 mod statis_ui;
 
-mod capture;
-fn main() -> iced::Result {
-    iced::application("Statis", Statis::update, Statis::view)
-            .window_size((400.0, 80.0))
-            .position(iced::window::Position::Specific(iced::Point::new(760.0, 0.0)))
-            .transparent(true)
-            .decorations(false)
-            .run_with(Statis::new)
+use statis_ui::X11ScreenshotTool;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut tool = X11ScreenshotTool::new()?;
+    tool.run()?;
+    Ok(())
 }
