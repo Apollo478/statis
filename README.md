@@ -7,7 +7,3 @@ Clone the repo and run:
 ```
 cargo build --release
 ```
- _._     _,-'""`-._
-(,-.`._,'(       |\`-/|
-    `-.-' \ )-`( , o o)
-          `-    \`_`"'-
