@@ -1,3 +1,4 @@
+use chrono::{DateTime, Local};
 use x11rb::{connection::Connection, protocol::Event};
 use x11rb::protocol::xproto::*;
 use x11rb::rust_connection::RustConnection;
@@ -89,7 +90,6 @@ impl X11ScreenshotTool {
             &data,
         )?;
 
-        // Map window
         conn.map_window(window)?;
         conn.configure_window(
             window,
@@ -116,7 +116,6 @@ impl X11ScreenshotTool {
     }
 
     pub fn run(&mut self) -> Result<(), Box<dyn Error>> {
-        // Initial draw
         self.redraw()?;
         
         loop {
@@ -173,7 +172,6 @@ impl X11ScreenshotTool {
     }
 
     fn redraw(&self) -> Result<(), Box<dyn Error>> {
-        // Copy screenshot from pixmap to window (very fast)
         self.conn.copy_area(
             self.screenshot_pixmap,
             self.window,
@@ -184,14 +182,12 @@ impl X11ScreenshotTool {
             self.height,
         )?;
         
-        // Draw selection rectangle if selecting
         if self.selecting {
             let x = self.start_x.min(self.current_x);
             let y = self.start_y.min(self.current_y);
             let width = (self.start_x.max(self.current_x) - x) as u16;
             let height = (self.start_y.max(self.current_y) - y) as u16;
 
-            // Update GC for drawing rectangle
             self.conn.change_gc(
                 self.gc,
                 &ChangeGCAux::new()
@@ -221,8 +217,9 @@ impl X11ScreenshotTool {
             height,
         })?;
         
+        let datetime :DateTime<Local> = Local::now();
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        let path = format!("{}/Downloads/screenshot.png", home);
+        let path = format!("{}/Pictures/Screenshots/screenshot-{}.png", home,datetime);
         img.save(&path)?;
         
         println!("Saved to {}", path);
